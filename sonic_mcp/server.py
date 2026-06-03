@@ -136,7 +136,7 @@ def save_song(name: str, code: str) -> str:
     song_dir = SONGS_DIR / name
     song_dir.mkdir(parents=True, exist_ok=True)
 
-    existing = sorted(song_dir.glob("v*.rb"))
+    existing = sorted(song_dir.glob("v*.rb"), key=lambda p: int(p.stem[1:]))
     next_v = (int(existing[-1].stem[1:]) + 1) if existing else 1
 
     target = song_dir / f"v{next_v}.rb"
@@ -180,7 +180,7 @@ def load_song(name: str, version: int = 0) -> str:
         return f"Song not found: {name}"
 
     if version == 0:
-        versions = sorted(song_dir.glob("v*.rb"))
+        versions = sorted(song_dir.glob("v*.rb"), key=lambda p: int(p.stem[1:]))
         if not versions:
             return f"No versions found for song: {name}"
         target = versions[-1]
