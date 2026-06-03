@@ -18,7 +18,7 @@ Add this to `~/.claude/mcp.json` for global use, or a project's `.mcp.json` to k
   "mcpServers": {
     "sonic-pi": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/yourusername/sonic-mcp.git", "sonic-mcp"],
+      "args": ["--from", "git+https://github.com/AJBogo9/sonic-mcp.git", "sonic-mcp"],
       "env": {
         "SONIC_PI_PATTERNS_DIR": "/home/yourname/patterns"
       }
