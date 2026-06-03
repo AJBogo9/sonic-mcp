@@ -6,6 +6,7 @@ Sonic Pi must be running with a listener buffer active (see README).
 """
 
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -20,6 +21,9 @@ LOG_PATH = Path.home() / ".sonic-pi" / "log" / "server-output.log"
 
 mcp = FastMCP("sonic-pi")
 _osc = udp_client.SimpleUDPClient(SONIC_PI_HOST, SONIC_PI_PORT)
+
+# Tracks the active pw-record process for recording
+_record_proc: subprocess.Popen | None = None
 
 
 def _send(address: str, *args):
@@ -114,24 +118,47 @@ def load_pattern(path: str) -> str:
 @mcp.tool()
 def record_start() -> str:
     """
-    Start Sonic Pi's built-in recording.
+    Start recording Sonic Pi's audio output via PipeWire.
     Returns the output path — pass it to record_stop when done.
+    Requires pw-record and pw-link (pipewire-utils package).
     """
+    global _record_proc
+    if _record_proc and _record_proc.poll() is None:
+        _record_proc.terminate()
+        _record_proc.wait()
+
     output_path = str(Path.home() / f"sonic-pi-recording-{int(time.time())}.wav")
-    _send("/start-recording")
+
+    # Start pw-record without auto-linking (target 0) so we control the connections
+    _record_proc = subprocess.Popen(
+        ["pw-record", "--target", "0", "--rate", "48000", "--channels", "2", output_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for pw-record to register its ports in PipeWire
+    time.sleep(1.5)
+
+    # Link SuperCollider's JACK output to pw-record's input
+    subprocess.run(["pw-link", "SuperCollider:out_1", "pw-record:input_FL"], capture_output=True)
+    subprocess.run(["pw-link", "SuperCollider:out_2", "pw-record:input_FR"], capture_output=True)
+
     return output_path
 
 
 @mcp.tool()
 def record_stop(output_path: str) -> str:
     """
-    Stop Sonic Pi's recording and save to disk.
+    Stop the PipeWire recording and save to disk.
 
     Args:
         output_path: The path returned by record_start.
     """
-    _send("/stop-recording")
-    _send("/save-recording", output_path)
+    global _record_proc
+    if _record_proc and _record_proc.poll() is None:
+        _record_proc.terminate()
+        _record_proc.wait()
+        _record_proc = None
     return f"Recording saved to {output_path}."
 
 
