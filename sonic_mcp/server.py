@@ -17,7 +17,11 @@ SONIC_PI_HOST = "127.0.0.1"
 SONIC_PI_PORT = 4560
 
 PATTERNS_DIR = Path(os.environ.get("SONIC_PI_PATTERNS_DIR", Path.home() / "patterns"))
-LOG_PATH = Path.home() / ".sonic-pi" / "log" / "server-output.log"
+SONGS_DIR    = Path(os.environ.get("SONIC_PI_SONGS_DIR",    Path.home() / "songs"))
+
+# server-errors.log captures runtime errors from eval'd code (warnings, exceptions)
+# server-output.log only contains boot messages
+LOG_PATH = Path.home() / ".sonic-pi" / "log" / "server-errors.log"
 
 mcp = FastMCP("sonic-pi")
 _osc = udp_client.SimpleUDPClient(SONIC_PI_HOST, SONIC_PI_PORT)
@@ -42,7 +46,9 @@ def run_code(code: str) -> str:
 
 @mcp.tool()
 def stop_all() -> str:
-    """Stop all currently playing sounds in Sonic Pi."""
+    """Stop all currently playing sounds in Sonic Pi.
+    Note: this stops MCP-submitted jobs only. Jobs started from the Sonic Pi
+    GUI require pressing the Stop button in the GUI itself."""
     _send("/stop-all-jobs")
     return "Stopped all jobs."
 
@@ -50,7 +56,8 @@ def stop_all() -> str:
 @mcp.tool()
 def get_log(lines: int = 50) -> str:
     """
-    Read the tail of Sonic Pi's server output log.
+    Read the tail of Sonic Pi's server errors log.
+    This captures runtime errors and warnings from eval'd code.
     Use this to check for errors after running code.
     """
     if not LOG_PATH.exists():
@@ -66,7 +73,8 @@ def get_log(lines: int = 50) -> str:
 @mcp.tool()
 def save_pattern(name: str, category: str, code: str) -> str:
     """
-    Save a Sonic Pi pattern to the local pattern library.
+    Save a reusable Sonic Pi snippet to the pattern library.
+    For full songs with arrangement, use save_song instead.
 
     Args:
         name: File name without extension (e.g. "boom_bap_basic")
@@ -116,6 +124,75 @@ def load_pattern(path: str) -> str:
 
 
 @mcp.tool()
+def save_song(name: str, code: str) -> str:
+    """
+    Save a full song to the songs library with auto-incrementing version number.
+    Creates songs/{name}/v{N}.rb, where N is one higher than the current latest version.
+
+    Args:
+        name: Song folder name in snake_case (e.g. "dark_pop_em", "aurora_borealis")
+        code: The Sonic Pi Ruby code to save
+    """
+    song_dir = SONGS_DIR / name
+    song_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = sorted(song_dir.glob("v*.rb"))
+    next_v = (int(existing[-1].stem[1:]) + 1) if existing else 1
+
+    target = song_dir / f"v{next_v}.rb"
+    target.write_text(code)
+    return f"Saved to {target}"
+
+
+@mcp.tool()
+def list_songs(name: str = "") -> str:
+    """
+    List songs in the songs library.
+
+    Args:
+        name: Optional song name to list versions of (e.g. "dark_pop_em").
+              Leave empty to list all songs and versions.
+    """
+    search_root = SONGS_DIR / name if name else SONGS_DIR
+
+    if not search_root.exists():
+        return f"No songs found. Directory does not exist: {search_root}"
+
+    songs = sorted(search_root.rglob("*.rb"))
+    if not songs:
+        return "No songs found."
+
+    return "\n".join(str(p.relative_to(SONGS_DIR)) for p in songs)
+
+
+@mcp.tool()
+def load_song(name: str, version: int = 0) -> str:
+    """
+    Load a song from the songs library.
+
+    Args:
+        name: Song folder name (e.g. "dark_pop_em")
+        version: Version number to load (e.g. 3 loads v3.rb).
+                 Use 0 (default) to load the latest version.
+    """
+    song_dir = SONGS_DIR / name
+    if not song_dir.exists():
+        return f"Song not found: {name}"
+
+    if version == 0:
+        versions = sorted(song_dir.glob("v*.rb"))
+        if not versions:
+            return f"No versions found for song: {name}"
+        target = versions[-1]
+    else:
+        target = song_dir / f"v{version}.rb"
+        if not target.exists():
+            return f"Version v{version} not found for song: {name}"
+
+    return target.read_text()
+
+
+@mcp.tool()
 def record_start() -> str:
     """
     Start recording Sonic Pi's audio output via PipeWire.
@@ -129,17 +206,14 @@ def record_start() -> str:
 
     output_path = str(Path.home() / f"sonic-pi-recording-{int(time.time())}.wav")
 
-    # Start pw-record without auto-linking (target 0) so we control the connections
     _record_proc = subprocess.Popen(
         ["pw-record", "--target", "0", "--rate", "48000", "--channels", "2", output_path],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    # Wait for pw-record to register its ports in PipeWire
     time.sleep(1.5)
 
-    # Link SuperCollider's JACK output to pw-record's input
     subprocess.run(["pw-link", "SuperCollider:out_1", "pw-record:input_FL"], capture_output=True)
     subprocess.run(["pw-link", "SuperCollider:out_2", "pw-record:input_FR"], capture_output=True)
 
