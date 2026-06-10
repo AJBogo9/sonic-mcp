@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Start Sonic Pi without the Qt GUI.
+#
+# Uses fixed ports so the MCP server always knows where to connect:
+#   Spider server:  UDP 4557
+#   OSC cues:       UDP 4560 (unchanged)
+#   scsynth:        UDP 4556
+#   GUI echo port:  UDP 4558 (nothing listens here -- UDP drops are silent)
+#   Erlang router:  UDP 4561
+#   MIDI out:       UDP 4563
+#   MIDI in:        UDP 4564
+#   Websocket:      4562 (unused)
+#
+# Audio via PipeWire-JACK (pw-jack).
+
+set -e
+
+SP_SERVER="/usr/lib/sonic-pi/app/server/ruby/bin/sonic-pi-server.rb"
+SP_INIT="/usr/lib/sonic-pi/app/server/ruby/bin/init-script.rb"
+SP_LOG="$HOME/.sonic-pi/log/server-output.log"
+SP_ERR="$HOME/.sonic-pi/log/server-errors.log"
+SP_PID="$HOME/.sonic-pi/log/headless.pid"
+
+SPIDER_PORT=4557
+
+# Refuse to start if already running
+if [ -f "$SP_PID" ] && kill -0 "$(cat "$SP_PID")" 2>/dev/null; then
+    echo "Sonic Pi headless already running (PID $(cat "$SP_PID"))"
+    echo "Use sonicpi-stop to stop it first."
+    exit 1
+fi
+
+# Also refuse if the Qt GUI is running on the expected ports
+if ss -ulnp | grep -q ":$SPIDER_PORT "; then
+    echo "Port $SPIDER_PORT is in use -- Sonic Pi may already be running (perhaps the Qt GUI?)."
+    echo "Use sonicpi-stop or close the Qt GUI first."
+    exit 1
+fi
+
+mkdir -p "$HOME/.sonic-pi/log"
+
+echo "Running init..."
+ruby "$SP_INIT" 2>/dev/null || true
+
+echo "Starting Sonic Pi headless on port $SPIDER_PORT..."
+echo "  Output log: $SP_LOG"
+echo "  Error log:  $SP_ERR"
+
+# Start in UDP mode with fixed ports.
+# pw-jack provides JACK compatibility via PipeWire.
+# Ports: server gui scsynth scsynth-send osc-cues erlang midi-out midi-in websocket
+pw-jack ruby "$SP_SERVER" -u \
+    $SPIDER_PORT 4558 4556 4556 4560 4561 4563 4564 4562 \
+    >>"$SP_LOG" 2>>"$SP_ERR" &
+
+echo $! >"$SP_PID"
+
+# Wait for "Sonic Pi Server successfully booted."
+echo -n "Booting"
+TIMEOUT=60
+for i in $(seq 1 $TIMEOUT); do
+    if grep -q "Sonic Pi Server successfully booted\." "$SP_LOG" 2>/dev/null; then
+        echo ""
+        echo "Ready. Sonic Pi headless is running (PID $(cat "$SP_PID"))."
+        echo "MCP connects to UDP 127.0.0.1:$SPIDER_PORT"
+        exit 0
+    fi
+    if ! kill -0 "$(cat "$SP_PID")" 2>/dev/null; then
+        echo ""
+        echo "Process exited unexpectedly. Check the logs:"
+        echo "  tail -50 $SP_ERR"
+        rm -f "$SP_PID"
+        exit 1
+    fi
+    echo -n "."
+    sleep 1
+done
+
+echo ""
+echo "Timed out waiting for boot (${TIMEOUT}s). Check the logs:"
+echo "  tail -50 $SP_LOG"
+echo "  tail -50 $SP_ERR"
+exit 1

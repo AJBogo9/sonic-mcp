@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Stop a headless Sonic Pi instance started with sonicpi-headless.
+# Sends SIGTERM to the Ruby server; it handles its own cleanup (kills scsynth, erlang, etc).
+
+SP_PID="$HOME/.sonic-pi/log/headless.pid"
+
+if [ ! -f "$SP_PID" ]; then
+    echo "No headless.pid found -- was Sonic Pi started with sonicpi-headless?"
+    exit 1
+fi
+
+PID=$(cat "$SP_PID")
+
+if ! kill -0 "$PID" 2>/dev/null; then
+    echo "Process $PID is not running (already stopped?)."
+    rm -f "$SP_PID"
+    exit 0
+fi
+
+echo "Stopping Sonic Pi headless (PID $PID)..."
+kill "$PID"
+
+# Wait up to 10s for clean exit
+for i in $(seq 1 10); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+        rm -f "$SP_PID"
+        echo "Stopped."
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "Process did not exit cleanly -- sending SIGKILL..."
+kill -9 "$PID" 2>/dev/null || true
+rm -f "$SP_PID"
+echo "Killed."

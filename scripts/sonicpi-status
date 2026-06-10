@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Show the status of Sonic Pi (headless or Qt GUI).
+
+SP_PID="$HOME/.sonic-pi/log/headless.pid"
+SP_LOG="$HOME/.sonic-pi/log/server-output.log"
+SP_ERR="$HOME/.sonic-pi/log/server-errors.log"
+
+HEADLESS=false
+if [ -f "$SP_PID" ] && kill -0 "$(cat "$SP_PID")" 2>/dev/null; then
+    HEADLESS=true
+fi
+
+# Detect any running Sonic Pi Ruby server
+RUBY_PID=$(pgrep -f "sonic-pi-server.rb" | head -1)
+
+if [ -z "$RUBY_PID" ]; then
+    echo "Sonic Pi: not running"
+    exit 0
+fi
+
+if $HEADLESS; then
+    echo "Sonic Pi: running headless (PID $(cat "$SP_PID"))"
+else
+    echo "Sonic Pi: running (Qt GUI mode, PID $RUBY_PID)"
+fi
+
+# Show the Spider port
+SPIDER_PORT=$(grep "Listen port:" "$SP_LOG" 2>/dev/null | tail -1 | awk '{print $NF}')
+if [ -n "$SPIDER_PORT" ]; then
+    echo "Spider server: UDP 127.0.0.1:$SPIDER_PORT"
+fi
+
+# Show last 5 lines of error log
+if [ -f "$SP_ERR" ]; then
+    echo ""
+    echo "Recent log ($SP_ERR):"
+    tail -5 "$SP_ERR"
+fi
