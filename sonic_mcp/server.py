@@ -1,11 +1,15 @@
 """
 Sonic Pi MCP Server
 
-Connects Claude Code to Sonic Pi via OSC messages.
-Sonic Pi must be running with a listener buffer active (see README).
+Connects Claude Code to Sonic Pi via OSC (UDP).
+
+Port 4560 (fixed): Erlang OSC cues -- triggers sync "/osc*" events in running code.
+Spider server:      UDP, port discovered from ~/.sonic-pi/log/server-output.log.
+                    Defaults to 4557 (headless mode) if log is absent or unreadable.
 """
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -14,67 +18,207 @@ from mcp.server.fastmcp import FastMCP
 from pythonosc import udp_client
 
 SONIC_PI_HOST = "127.0.0.1"
-SONIC_PI_PORT = 4560
+OSC_CUES_PORT = 4560   # Erlang OSC cues, always fixed
+GUI_ID = "mcp"
 
 PATTERNS_DIR = Path(os.environ.get("SONIC_PI_PATTERNS_DIR", Path.home() / "patterns"))
 SONGS_DIR    = Path(os.environ.get("SONIC_PI_SONGS_DIR",    Path.home() / "songs"))
 
-# server-errors.log captures runtime errors from eval'd code (warnings, exceptions)
-# server-output.log only contains boot messages
-LOG_PATH = Path.home() / ".sonic-pi" / "log" / "server-errors.log"
+SERVER_OUTPUT_LOG = Path.home() / ".sonic-pi" / "log" / "server-output.log"
+SERVER_ERRORS_LOG = Path.home() / ".sonic-pi" / "log" / "server-errors.log"
 
 mcp = FastMCP("sonic-pi")
-_osc = udp_client.SimpleUDPClient(SONIC_PI_HOST, SONIC_PI_PORT)
 
-# Tracks the active pw-record process for recording
+# UDP client for Erlang OSC cues (triggers sync in running Sonic Pi code)
+_cues_client = udp_client.SimpleUDPClient(SONIC_PI_HOST, OSC_CUES_PORT)
+
+# Tracks the active pw-record process
 _record_proc: subprocess.Popen | None = None
 
+# Spider server UDP client -- lazily created after port discovery
+_spider_client: udp_client.SimpleUDPClient | None = None
 
-def _send(address: str, *args):
-    _osc.send_message(address, list(args) if args else None)
+
+def _discover_spider_port() -> int:
+    """Read the Spider server port from the last boot log entry."""
+    if not SERVER_OUTPUT_LOG.exists():
+        return 4557
+    with SERVER_OUTPUT_LOG.open(errors="replace") as f:
+        for line in reversed(f.readlines()):
+            m = re.match(r"Listen port:\s*(\d+)", line.strip())
+            if m:
+                return int(m.group(1))
+    return 4557
 
 
-# --- Tools ---
+def _spider() -> udp_client.SimpleUDPClient:
+    """Return (and lazily create) the Spider server UDP client."""
+    global _spider_client
+    if _spider_client is None:
+        port = _discover_spider_port()
+        _spider_client = udp_client.SimpleUDPClient(SONIC_PI_HOST, port)
+    return _spider_client
+
+
+def _spider_send(address: str, *args):
+    """Send an OSC message to the Spider server with GUI_ID prepended."""
+    _spider().send_message(address, [GUI_ID, *args])
+
+
+def _cue(address: str, *args):
+    """Send an OSC cue to the Erlang cues port (triggers sync in Sonic Pi code)."""
+    _cues_client.send_message(address, list(args) if args else None)
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def run_code(code: str) -> str:
-    """Send Sonic Pi code to execute. Sonic Pi must have the listener buffer running."""
-    _send("/run-code", code)
+    """Run Sonic Pi code. Sonic Pi must be running (GUI or headless)."""
+    _spider_send("/run-code", code)
     return "Code sent to Sonic Pi."
 
 
 @mcp.tool()
+def run_in_buffer(buffer_id: int, code: str) -> str:
+    """Save and run code in a specific Sonic Pi buffer slot (0-9).
+
+    Mirrors the GUI buffer tabs. Useful for organizing live_loops across multiple slots.
+
+    Args:
+        buffer_id: Buffer index 0-9
+        code: The Sonic Pi Ruby code to run
+    """
+    _spider_send("/save-and-run-buffer", buffer_id, code, "")
+    return f"Code sent to buffer {buffer_id}."
+
+
+@mcp.tool()
 def stop_all() -> str:
-    """Stop all currently playing sounds in Sonic Pi.
-    Note: this stops MCP-submitted jobs only. Jobs started from the Sonic Pi
-    GUI require pressing the Stop button in the GUI itself."""
-    _send("/stop-all-jobs")
+    """Stop all currently playing sounds, including buffers started from the GUI."""
+    _spider_send("/stop-all-jobs")
     return "Stopped all jobs."
 
 
 @mcp.tool()
 def get_log(lines: int = 50) -> str:
-    """
-    Read the tail of Sonic Pi's server errors log.
-    This captures runtime errors and warnings from eval'd code.
-    Use this to check for errors after running code.
-    """
-    if not LOG_PATH.exists():
-        return f"Log file not found at {LOG_PATH}. Make sure Sonic Pi has been run at least once."
+    """Read the tail of Sonic Pi's server errors log.
 
-    with LOG_PATH.open("r", errors="replace") as f:
+    Captures runtime errors and warnings from eval'd code.
+    Call this after run_code to check for errors.
+    """
+    if not SERVER_ERRORS_LOG.exists():
+        return f"Log file not found at {SERVER_ERRORS_LOG}. Make sure Sonic Pi has been run at least once."
+
+    with SERVER_ERRORS_LOG.open(errors="replace") as f:
         all_lines = f.readlines()
 
     tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
     return "".join(tail) or "(log is empty)"
 
 
+# ---------------------------------------------------------------------------
+# Mixer controls
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def set_master_volume(amp: float) -> str:
+    """Set the master output volume.
+
+    Args:
+        amp: Amplitude multiplier. 1.0 is unity gain, 0.0 is silence, up to 5.0 (may clip).
+    """
+    _spider_send("/mixer-amp", amp, 0)
+    return f"Master volume set to {amp}."
+
+
+@mcp.tool()
+def mixer_hpf_enable(freq: float) -> str:
+    """Enable a high-pass filter on the master output.
+
+    Args:
+        freq: Cutoff frequency in Hz (e.g. 80.0 removes low rumble).
+    """
+    _spider_send("/mixer-hpf-enable", freq)
+    return f"High-pass filter enabled at {freq} Hz."
+
+
+@mcp.tool()
+def mixer_hpf_disable() -> str:
+    """Disable the master high-pass filter."""
+    _spider_send("/mixer-hpf-disable")
+    return "High-pass filter disabled."
+
+
+@mcp.tool()
+def mixer_lpf_enable(freq: float) -> str:
+    """Enable a low-pass filter on the master output.
+
+    Args:
+        freq: Cutoff frequency in Hz (e.g. 8000.0 softens the high end).
+    """
+    _spider_send("/mixer-lpf-enable", freq)
+    return f"Low-pass filter enabled at {freq} Hz."
+
+
+@mcp.tool()
+def mixer_lpf_disable() -> str:
+    """Disable the master low-pass filter."""
+    _spider_send("/mixer-lpf-disable")
+    return "Low-pass filter disabled."
+
+
+@mcp.tool()
+def mixer_stereo_mode() -> str:
+    """Switch master output to stereo mode (default)."""
+    _spider_send("/mixer-stereo-mode")
+    return "Mixer set to stereo mode."
+
+
+@mcp.tool()
+def mixer_mono_mode() -> str:
+    """Switch master output to mono mode (sums left and right channels)."""
+    _spider_send("/mixer-mono-mode")
+    return "Mixer set to mono mode."
+
+
+# ---------------------------------------------------------------------------
+# OSC cues (for sync points in running Sonic Pi code)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def send_cue(path: str, value: str = "") -> str:
+    """Send an OSC cue to trigger a sync point in running Sonic Pi code.
+
+    Use to trigger live_loops or one_shot blocks waiting on sync.
+    Path must start with /. Example: /trigger/drop
+
+    Args:
+        path: OSC address, e.g. "/trigger/drop" or "/scene/chorus"
+        value: Optional string value passed as the cue argument
+    """
+    if value:
+        _cue(path, value)
+    else:
+        _cue(path)
+    return f"Cue sent: {path}"
+
+
+# ---------------------------------------------------------------------------
+# Pattern library
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool()
 def save_pattern(name: str, category: str, code: str) -> str:
-    """
-    Save a reusable Sonic Pi snippet to the pattern library.
-    For full songs with arrangement, use save_song instead.
+    """Save a reusable Sonic Pi snippet to the pattern library.
+
+    For full songs, use save_song instead.
 
     Args:
         name: File name without extension (e.g. "boom_bap_basic")
@@ -90,8 +234,7 @@ def save_pattern(name: str, category: str, code: str) -> str:
 
 @mcp.tool()
 def list_patterns(category: str = "") -> str:
-    """
-    List saved patterns in the pattern library.
+    """List saved patterns in the pattern library.
 
     Args:
         category: Optional subfolder to filter by (e.g. "drums"). Leave empty to list all.
@@ -105,14 +248,12 @@ def list_patterns(category: str = "") -> str:
     if not patterns:
         return "No patterns found."
 
-    lines = [str(p.relative_to(PATTERNS_DIR)) for p in patterns]
-    return "\n".join(lines)
+    return "\n".join(str(p.relative_to(PATTERNS_DIR)) for p in patterns)
 
 
 @mcp.tool()
 def load_pattern(path: str) -> str:
-    """
-    Load a saved pattern from the library, returning its code.
+    """Load a saved pattern from the library, returning its code.
 
     Args:
         path: Relative path from the patterns root (e.g. "drums/boom_bap_basic.rb")
@@ -123,11 +264,16 @@ def load_pattern(path: str) -> str:
     return target.read_text()
 
 
+# ---------------------------------------------------------------------------
+# Song library
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool()
 def save_song(name: str, code: str) -> str:
-    """
-    Save a full song to the songs library with auto-incrementing version number.
-    Creates songs/{name}/v{N}.rb, where N is one higher than the current latest version.
+    """Save a full song to the songs library with auto-incrementing version number.
+
+    Creates songs/{name}/v{N}.rb where N is one higher than the current latest version.
 
     Args:
         name: Song folder name in snake_case (e.g. "dark_pop_em", "aurora_borealis")
@@ -146,8 +292,7 @@ def save_song(name: str, code: str) -> str:
 
 @mcp.tool()
 def list_songs(name: str = "") -> str:
-    """
-    List songs in the songs library.
+    """List songs in the songs library.
 
     Args:
         name: Optional song name to list versions of (e.g. "dark_pop_em").
@@ -167,8 +312,7 @@ def list_songs(name: str = "") -> str:
 
 @mcp.tool()
 def load_song(name: str, version: int = 0) -> str:
-    """
-    Load a song from the songs library.
+    """Load a song from the songs library.
 
     Args:
         name: Song folder name (e.g. "dark_pop_em")
@@ -192,11 +336,16 @@ def load_song(name: str, version: int = 0) -> str:
     return target.read_text()
 
 
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool()
 def record_start() -> str:
-    """
-    Start recording Sonic Pi's audio output via PipeWire.
-    Returns the output path — pass it to record_stop when done.
+    """Start recording Sonic Pi's audio output via PipeWire.
+
+    Returns the output path -- pass it to record_stop when done.
     Requires pw-record and pw-link (pipewire-utils package).
     """
     global _record_proc
@@ -222,8 +371,7 @@ def record_start() -> str:
 
 @mcp.tool()
 def record_stop(output_path: str) -> str:
-    """
-    Stop the PipeWire recording and save to disk.
+    """Stop the PipeWire recording and save to disk.
 
     Args:
         output_path: The path returned by record_start.
