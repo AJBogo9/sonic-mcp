@@ -55,11 +55,14 @@ pw-jack ruby "$SP_SERVER" -u \
 
 echo $! >"$SP_PID"
 
+# Record how many lines are in the log right now so we only search new output.
+LOG_OFFSET=$(wc -l <"$SP_LOG" 2>/dev/null || echo 0)
+
 # Wait for "Sonic Pi Server successfully booted."
 echo -n "Booting"
 TIMEOUT=60
 for i in $(seq 1 $TIMEOUT); do
-    if grep -q "Sonic Pi Server successfully booted\." "$SP_LOG" 2>/dev/null; then
+    if tail -n +"$((LOG_OFFSET + 1))" "$SP_LOG" 2>/dev/null | grep -q "Sonic Pi Server successfully booted\."; then
         echo ""
         echo "Ready. Sonic Pi headless is running (PID $(cat "$SP_PID"))."
         echo "MCP connects to UDP 127.0.0.1:$SPIDER_PORT"

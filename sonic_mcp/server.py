@@ -52,10 +52,10 @@ def _discover_spider_port() -> int:
 
 
 def _spider() -> udp_client.SimpleUDPClient:
-    """Return (and lazily create) the Spider server UDP client."""
+    """Return the Spider server UDP client, re-discovering the port if Sonic Pi restarted."""
     global _spider_client
-    if _spider_client is None:
-        port = _discover_spider_port()
+    port = _discover_spider_port()
+    if _spider_client is None or _spider_client._address[1] != port:
         _spider_client = udp_client.SimpleUDPClient(SONIC_PI_HOST, port)
     return _spider_client
 
@@ -101,6 +101,29 @@ def stop_all() -> str:
     """Stop all currently playing sounds, including buffers started from the GUI."""
     _spider_send("/stop-all-jobs")
     return "Stopped all jobs."
+
+
+@mcp.tool()
+def ping() -> str:
+    """Check whether Sonic Pi is running and which port it is on.
+
+    Reads the boot log and checks that the Spider server port is open.
+    Does not send any OSC message -- safe to call at any time.
+    """
+    import socket
+    port = _discover_spider_port()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(0.1)
+        sock.connect((SONIC_PI_HOST, port))
+        reachable = True
+    except OSError:
+        reachable = False
+    finally:
+        sock.close()
+
+    status = "reachable" if reachable else "not reachable"
+    return f"Sonic Pi Spider server: UDP {SONIC_PI_HOST}:{port} -- {status}"
 
 
 @mcp.tool()
@@ -200,13 +223,26 @@ def send_cue(path: str, value: str = "") -> str:
 
     Args:
         path: OSC address, e.g. "/trigger/drop" or "/scene/chorus"
-        value: Optional string value passed as the cue argument
+        value: Optional value passed as the cue argument. Integers and floats
+               are sent as their native OSC types; anything else as a string.
     """
-    if value:
-        _cue(path, value)
-    else:
+    if not value:
         _cue(path)
-    return f"Cue sent: {path}"
+        return f"Cue sent: {path}"
+
+    # Coerce to int or float when the string looks numeric, so Sonic Pi
+    # code can use the value directly without parsing it.
+    typed: int | float | str
+    try:
+        typed = int(value)
+    except ValueError:
+        try:
+            typed = float(value)
+        except ValueError:
+            typed = value
+
+    _cue(path, typed)
+    return f"Cue sent: {path} ({typed!r})"
 
 
 # ---------------------------------------------------------------------------
